@@ -10,8 +10,6 @@ repositories {
 }
 
 dependencies {
-    implementation("com.google.guava:guava:28.1-jre")
-
     compile("org.projectlombok", "lombok", "1.18.10")
     annotationProcessor ("org.projectlombok", "lombok", "1.18.10")
 

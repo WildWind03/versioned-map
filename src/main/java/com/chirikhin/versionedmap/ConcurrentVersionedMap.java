@@ -1,113 +1,140 @@
 package com.chirikhin.versionedmap;
 
-import com.google.common.collect.Lists;
+import lombok.AllArgsConstructor;
+import lombok.Getter;
 
-import java.util.Collections;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.CopyOnWriteArrayList;
 
 /**
  * A thread-safe implementation of {@link com.chirikhin.versionedmap.VersionedMap}
  */
 public class ConcurrentVersionedMap<K, V> implements VersionedMap<K, V> {
 
-    private final Map<K, List<Element<V>>> internalMap = new ConcurrentHashMap<>();
+    private final Map<K, List<Element<V>>> allVersionsMap = new ConcurrentHashMap<>();
 
-    private int versionCounter = 0;
+    private final Map<K, V> lastVersionMap = new ConcurrentHashMap<>();
+
+    private volatile int versionCounter = 0;
 
     /**
-     * Increments version of the map and associates the specified value with the specified key in the map of
-     * the new version. If the map previously contained a mapping for the key, the old value is replaced by the
-     * specified value in the new version of the map. All the other mappings that the map of the previous version had
-     * are still available in the map of the new version
-     * @return a new version of the map
+     * @throws NullPointerException if the specified key or value is null
      */
     @Override
-    public synchronized int put(K key, V value) {
-        List<Element<V>> elementList = internalMap.get(key);
-
-        if (null == elementList) {
-            elementList = new CopyOnWriteArrayList<>();
-            elementList.add(new Element<>(versionCounter + 1, value));
-            internalMap.put(key, elementList);
-        } else {
-            elementList.add(new Element<>(versionCounter + 1, value));
+    public int put(K key, V value) {
+        if (null == value || null == key) {
+            throw new NullPointerException("Key and value cannot be null");
         }
 
-        return ++versionCounter;
+        return addNewElement(key, value);
     }
 
     /**
-     * @return a value corresponding to the key and stored in the map of the last version
+     * @throws NullPointerException if the specified key is null
      */
     @Override
     public V get(K key) {
-        List<Element<V>> elementList = internalMap.get(key);
-
-        if (null == elementList) {
-            return null;
-        }
-
-        return elementList.get(elementList.size() - 1).getValue();
+        return lastVersionMap.get(key);
     }
 
     /**
-     * @return a value corresponding to the key and stored in the map of the specified version.
-     * If the passed version is higher than the map's version, the map's version is used instead
+     * @throws NullPointerException if the specified key is null
      */
     @Override
     public V getByVersion(K key, int version) {
-        List<Element<V>> elementList = internalMap.get(key);
-
-        if (null == elementList) {
-            return null;
+        if (null == key) {
+            throw new NullPointerException("Key cannot be null");
         }
 
         /*
-        This transformation is made lazily and therefore applies only on the elements used in the binary search
+        The allVersionsMap map should not be used if the lastVersionMap is already cleared. This piece of code
+        prevents the situation when this method is called during the map is being cleared by another thread
+        and the lastVersionMap is already cleared but the allVersionsMap has not yet
          */
-        List<Integer> versionList = Lists.transform(elementList, Element::getVersion);
+        if (0 == versionCounter && lastVersionMap.isEmpty()) {
+            return null;
+        }
 
-        int foundElementIndex = Collections.binarySearch(versionList, version);
+        List<Element<V>> elementList = allVersionsMap.get(key);
 
-        if (foundElementIndex < 0) {
-            /*
-            The binary search method returns (-(insertion point) - 1). To calculate the insertion point from that,
-            it is needed to add 1 to the returned value and then multiply by (-1)
-             */
-            int insertionPoint = (-1) * (foundElementIndex + 1);
+        /*
+        Lack of the element in the allVersionsMap does not mean that the element has not already bean inserted into the
+        lastVersionMap (see the order of insertion in the addNewElement method). This piece of code prevents
+        the situation when result of getting element of the last version can be different by using this method
+        and regular get
+        */
+        if (null == elementList || isRequestedVersionLast(version, elementList)) {
+            return get(key);
+        }
 
-            /*
-            "insertionPoint - 1 < 0" means that there is no element with the lower version than the requested one
-            and as a result the map of the requested version doesn't contain a value corresponding to the requested
-            version
-             */
-            if (insertionPoint - 1 < 0) {
-                return null;
-            } else {
-                return elementList.get(insertionPoint - 1).getValue();
-            }
-        } else {
+        int foundElementIndex = Collections.binarySearch(elementList, (VersionedObject) () -> version,
+                Comparator.comparing(VersionedObject::getVersion));
+
+        if (foundElementIndex >= 0) {
             return elementList.get(foundElementIndex).getValue();
+        } else if (-1 == foundElementIndex) {
+            return null;
+        } else {
+            int insertionPoint = (-1) * (foundElementIndex + 1);
+            return elementList.get(insertionPoint - 1).getValue();
         }
     }
 
-    /**
-     * @return the current version of the map. The initial version is 0
-     */
+    @Override
+    public int delete(K key) {
+        return addNewElement(key, null);
+    }
+
     @Override
     public synchronized int getCurrentVersion() {
         return versionCounter;
     }
 
-    /**
-     * Removes all the data stored in the map and sets the map's version to 0
-     */
     @Override
     public synchronized void clear() {
         versionCounter = 0;
-        internalMap.clear();
+        lastVersionMap.clear();
+        allVersionsMap.clear();
+    }
+
+    private synchronized int addNewElement(K key, V value) {
+        List<Element<V>> elementList = allVersionsMap.get(key);
+        List<Element<V>> newElementList;
+
+        if (null == elementList) {
+            newElementList = new ArrayList<>(1);
+        } else {
+            newElementList = new ArrayList<>(elementList.size() + 1);
+            newElementList.addAll(elementList);
+        }
+
+        ++versionCounter;
+
+        newElementList.add(new Element<>(versionCounter, value));
+
+        if (null == value) {
+            lastVersionMap.remove(key);
+        } else {
+            lastVersionMap.put(key, value);
+        }
+
+        allVersionsMap.put(key, newElementList);
+
+        return versionCounter;
+    }
+
+    private boolean isRequestedVersionLast(int version, List<Element<V>> elementList) {
+        return version >= elementList.get(elementList.size() - 1).getVersion();
+    }
+
+    @Getter
+    @AllArgsConstructor
+    private static class Element<V> implements VersionedObject {
+        private final int version;
+        private final V value;
+    }
+
+    private interface VersionedObject {
+        int getVersion();
     }
 }
